@@ -1,35 +1,35 @@
 import { Server } from "socket.io";
 import Redis from "ioredis";
-import StgLog from "./models/stgLog.js";
-import Log from "./models/logs.js";
 // import Redis from "ioredis";
-import sSchema from "./models/strategy.js";
-// import Log from "./models/stgLog.js";
-import account from "./models/client.js";
-import redisConnect from "./utils/connectRedis.js";
+import {
+  Client as account,
+  Log,
+  StgLog,
+  Strategy as sSchema,
+  Strategy as StrategySchema,
+  StgTag,
+  redisConnect,
+  REDIS_MESSAGES, 
+  fetchIndexData,
+  config
+} from "./utils/sharedImport.js";
 import { getClientPositions, getPositions } from "./controllers/positions.js";
 import processTrades from "./utils/processTrades.js";
 import { saveLog } from "./utils/saveLog.js";
 import getStraddle from "./controllers/straddle.js";
-import StrategySchema from "./models/strategy.js";
-import StgTag from "./models/tag.js";
 import { getSystemStatusInfo } from "./controllers/systemStatus.js";
-import { REDIS_MESSAGES, fetchIndexData } from "./utils/sharedImport.js";
 
 const client = redisConnect();
+const indices = [
+  "BANKNIFTY",
+  "FINNIFTY",
+  "MIDCPNIFTY",
+  "NIFTY",
+  "SENSEX",
+];
 
 const Socket = (socketServer) => {
-  const io = new Server(socketServer, {
-    cors: {
-      origin: [
-        "http://localhost:3000",
-        "https://uat.robowriter.in",
-        "https://drtrade.robowriter.in",
-      ],
-      methods: ["GET", "POST"],
-      credentials: true,
-    },
-  });
+  const io = new Server(socketServer, config.cors);
 
   const topicIntervals = new Map();
   const lastPayloadByRoom = new Map();
@@ -72,6 +72,11 @@ const Socket = (socketServer) => {
     }
   }
 
+  function leaveTopicRoom(socket, roomName) {
+    socket.leave(roomName);
+    cleanupEmptyTopicIntervals();
+  }
+
   io.on("connection", (socket) => {
     console.log(socket.id, "Socket Connection Established");
 
@@ -92,10 +97,9 @@ const Socket = (socketServer) => {
     });
 
     socket.on("unsubscribeStg", ({ stgName }) => {
-      if (!stgName) return;
-      const roomName = `stg:${stgName}`;
-      socket.leave(roomName);
-      cleanupEmptyTopicIntervals();
+      if (stgName) {
+        leaveTopicRoom(socket, `stg:${stgName}`);
+      }
     });
 
     socket.on("subscribeLogs", () => {
@@ -108,6 +112,10 @@ const Socket = (socketServer) => {
         } catch {}
       })();
       cleanupEmptyTopicIntervals();
+    });
+
+    socket.on("unsubscribeLogs", () => {
+      leaveTopicRoom(socket, "logs");
     });
 
     socket.on("stgStatus", (runOnDay) => {
@@ -140,6 +148,12 @@ const Socket = (socketServer) => {
       cleanupEmptyTopicIntervals();
     });
 
+    socket.on("unsubscribeStgStatus", ({ roomName }) => {
+      if (roomName) {
+        leaveTopicRoom(socket, roomName);
+      }
+    });
+
     socket.on("getPositions", () => {
       const roomName = "positions";
       socket.join(roomName);
@@ -157,15 +171,34 @@ const Socket = (socketServer) => {
       cleanupEmptyTopicIntervals();
     });
 
-    socket.on("getStraddle", async () => {
-      try {
-        const straddleResults = await getStraddle();
-        socket.emit("straddleData", straddleResults);
-      } catch (error) {
-        console.error("Error fetching straddle data:", error);
-        socket.emit("straddleData", { error: error.message });
-      }
+    socket.on("unsubscribePositions", () => {
+      leaveTopicRoom(socket, "positions");
     });
+
+    socket.on("getStraddle", () => {
+      const roomName = "straddle";
+      socket.join(roomName);
+      ensureTopicInterval(
+        roomName,
+        1000,
+        () => getStraddle(),
+        "straddleData",
+      );
+      (async () => {
+        try {
+          socket.emit("straddleData", await getStraddle());
+        } catch (error) {
+          console.error("Error fetching straddle data:", error);
+          socket.emit("straddleData", { error: error.message });
+        }
+      })();
+      cleanupEmptyTopicIntervals();
+    });
+
+    socket.on("unsubscribeStraddle", () => {
+      leaveTopicRoom(socket, "straddle");
+    });
+
     socket.on("subscribeSystemStatus", () => {
       const roomName = "systemStatus";
       socket.join(roomName);
@@ -182,6 +215,7 @@ const Socket = (socketServer) => {
       })();
       cleanupEmptyTopicIntervals();
     });
+    
     socket.on("subscribeTagPnL", async ({ tag }) => {
       if (!tag) return;
       const roomName = `tagPnL:${tag}`;
@@ -198,6 +232,12 @@ const Socket = (socketServer) => {
         } catch {}
       })();
       cleanupEmptyTopicIntervals();
+    });
+
+    socket.on("unsubscribeTagPnL", ({ tag }) => {
+      if (tag) {
+        leaveTopicRoom(socket, `tagPnL:${tag}`);
+      }
     });
 
     socket.on("subscribeAccountWiseTagPnL", async ({ tag }) => {
@@ -405,6 +445,12 @@ const Socket = (socketServer) => {
       })();
       cleanupEmptyTopicIntervals();
     });
+    socket.on("unsubscribeAccountWiseTagPnL", ({ tag }) => {
+      if (tag) {
+        leaveTopicRoom(socket, `accountWiseTagPnL:${tag}`);
+      }
+    });
+
     socket.on("disconnecting", () => {
       cleanupEmptyTopicIntervals();
     });
@@ -438,10 +484,6 @@ async function fetchStgData(runOnDays) {
       },
     ]);
 
-    // get result
-
-    //  logic about pnl
-    // Batch: per-strategy view data
     const strategyNames = Array.from(new Set(table.map((t) => t.name)));
     const viewKeys = strategyNames.map((n) => `VIEW:${n}_view`);
     const viewVals = viewKeys.length ? await client.mget(viewKeys) : [];
@@ -493,17 +535,8 @@ async function fetchStgData(runOnDays) {
         target: view?.log?.[row.leg]?.target ?? 0,
       };
 
-      let lot;
-      if (obj.symbol?.includes("BANKNIFTY"))
-        lot = await fetchIndexData(client, "BANKNIFTY").lot;
-      else if (obj.symbol?.includes("FINNIFTY"))
-        lot = await fetchIndexData(client, "FINNIFTY").lot;
-      else if (obj.symbol?.includes("MIDCPNIFTY"))
-        lot = await fetchIndexData(client, "MIDCPNIFTY").lot;
-      else if (obj.symbol?.includes("NIFTY"))
-        lot = await fetchIndexData(client, "NIFTY").lot;
-      else if (obj.symbol?.includes("SENSEX"))
-        lot = await fetchIndexData(client, "SENSEX").lot;
+      const index = indices.find((name) => obj.symbol?.includes(name));
+      let lot = (await fetchIndexData(client, index)).lot;
 
       if ((row.orderStatus || "").toLowerCase() === "completed") {
         obj.pnl = (
@@ -528,7 +561,6 @@ async function fetchStgData(runOnDays) {
       }
       data1.push(obj);
     }
-
     // Now adding all pnl based on their unique name
     const aggregatedData = {};
 
@@ -644,16 +676,10 @@ async function getLiveStgLogs(stgName) {
       };
 
       let lot;
-      if (obj.symbol?.includes("BANKNIFTY"))
-        lot = (await fetchIndexData(client, "BANKNIFTY"))?.lot;
-      else if (obj.symbol?.includes("FINNIFTY"))
-        lot = (await fetchIndexData(client, "FINNIFTY"))?.lot;
-      else if (obj.symbol?.includes("MIDCPNIFTY"))
-        lot = (await fetchIndexData(client, "MIDCPNIFTY"))?.lot;
-      else if (obj.symbol?.includes("NIFTY"))
-        lot = (await fetchIndexData(client, "NIFTY"))?.lot;
-      else if (obj.symbol?.includes("SENSEX"))
-        lot = (await fetchIndexData(client, "SENSEX"))?.lot;
+      const index = indices.find((name) => obj.symbol?.includes(name));
+      if (index) {
+        lot = (await fetchIndexData(client, index))?.lot;
+      }
 
       if ((row.orderStatus || "").toLowerCase() === "completed") {
         obj.running_ltp = row.exitLtp;
@@ -1085,7 +1111,7 @@ async function getLiveLogsByTag(tag) {
       totalPnl: totalPnl.toFixed(2),
       adjustedTotalPnl: adjustedTotalPnl.toFixed(2),
       strategies: strategyPnl,
-      timestamp: new Date().toISOString(),
+      // timestamp: new Date().toISOString(),
       limits: {
         maxLoss,
         maxProfit,
@@ -1099,7 +1125,7 @@ async function getLiveLogsByTag(tag) {
       totalPnl: "0.00",
       adjustedTotalPnl: "0.00",
       strategies: [],
-      timestamp: new Date().toISOString(),
+      // timestamp: new Date().toISOString(),
       limits: {
         maxLoss: 0,
         maxProfit: 0,
